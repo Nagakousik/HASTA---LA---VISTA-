@@ -3,7 +3,9 @@ import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigate } from
 import { AuthProvider, useAuth } from "./context/AuthContext";
 import Landing from "./Components/Landing";
 import AuthModal from "./Components/AuthModal";
-import Dashboard from "./Components/Dashboard";
+import Prep from "./Components/Prep";
+import Check from "./Components/Check";
+import Interview from "./Components/Interview";
 
 /** Blocks signed-out visitors from private pages. */
 function ProtectedRoute({ children }) {
@@ -47,7 +49,9 @@ function AppRoutes() {
             />
           }
         />
-        <Route path="/app" element={<ProtectedRoute><Dashboard /></ProtectedRoute>} />
+        <Route path="/app" element={<ProtectedRoute><Prep /></ProtectedRoute>} />
+        <Route path="/app/check/:id" element={<ProtectedRoute><Check /></ProtectedRoute>} />
+        <Route path="/app/interview/:id" element={<ProtectedRoute><Interview /></ProtectedRoute>} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
 

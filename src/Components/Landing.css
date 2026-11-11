@@ -22,6 +22,7 @@ html { scroll-behavior: smooth; scroll-padding-top: 84px; -webkit-text-size-adju
   min-height: 100vh;
   min-height: 100dvh;
   overflow-x: hidden;
+  overflow-x: clip; /* hidden would break the sticky navbar; clip is used where supported */
   background: var(--bg);
   color: var(--ink);
   font-family: "Plus Jakarta Sans", system-ui, sans-serif;

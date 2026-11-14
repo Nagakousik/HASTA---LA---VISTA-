@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, Navigate, useNavigate, useParams } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
-import { getSession } from "../services/dataService";
+import { getSession, updateSession } from "../services/dataService";
+import { validateCandidateName } from "../utils/nameValidation";
 import Brand from "./Brand";
 import "./Landing.css";
 import "./Dashboard.css"; // holds the .splash loader used by App.jsx
@@ -34,6 +35,8 @@ export default function Check() {
   const { user } = useAuth();
   const navigate = useNavigate();
   const [session, setSession] = useState(undefined); // undefined = loading, null = not found
+  const [candidateName, setCandidateName] = useState("");
+  const [nameTouched, setNameTouched] = useState(false);
 
   const [perm, setPerm] = useState(HAS_MEDIA ? "idle" : "unsupported");
   const [cams, setCams] = useState([]);
@@ -55,12 +58,23 @@ export default function Check() {
   const sttOkRef = useRef(false);
   const sttActive = useRef(false);
   const speakingRef = useRef(false); // ignore mic and speech results while the speaker test plays
+  const mediaGen = useRef(0); // discards getUserMedia results from superseded calls
+  const spkTimer = useRef(null);
+  const spkId = useRef(0);
 
   useEffect(() => {
     let off = false;
-    getSession(user.uid, id).then((s) => !off && setSession(s)).catch(() => !off && setSession(null));
+    getSession(user.uid, id)
+      .then((s) => {
+        if (off) return;
+        setSession(s);
+        if (s) {
+          setCandidateName(s.candidateName || user.name || "");
+        }
+      })
+      .catch(() => !off && setSession(null));
     return () => { off = true; };
-  }, [id, user.uid]);
+  }, [id, user.uid, user.name]);
 
   const stopMedia = useCallback(() => {
     cancelAnimationFrame(rafRef.current);
@@ -75,11 +89,19 @@ export default function Check() {
     sttActive.current = false;
     try { recRef.current?.abort(); } catch { /* already stopped */ }
     recRef.current = null;
+    clearTimeout(spkTimer.current);
+    spkTimer.current = null;
+    speakingRef.current = false;
     window.speechSynthesis?.cancel();
   }, []);
 
-  // Always release the camera and mic when leaving the page
-  useEffect(() => () => { stopMedia(); stopSpeech(); }, [stopMedia, stopSpeech]);
+  // Always release the camera and mic when leaving the page. The generation bump
+  // makes any permission prompt that resolves later stop its stream immediately.
+  useEffect(() => () => {
+    mediaGen.current += 1;
+    stopMedia();
+    stopSpeech();
+  }, [stopMedia, stopSpeech]);
 
   const startMeter = useCallback((stream) => {
     const AC = window.AudioContext || window.webkitAudioContext;
@@ -114,7 +136,7 @@ export default function Check() {
     rec.continuous = true;
     rec.interimResults = true;
     rec.onresult = (e) => {
-      if (speakingRef.current) return;
+      if (recRef.current !== rec || speakingRef.current) return;
       let text = "";
       for (let i = e.resultIndex; i < e.results.length; i++) text += e.results[i][0].transcript;
       text = text.trim();
@@ -123,6 +145,7 @@ export default function Check() {
       if (!sttOkRef.current) { sttOkRef.current = true; setSttOk(true); setSttError(""); }
     };
     rec.onerror = (e) => {
+      if (recRef.current !== rec) return;
       if (e.error === "no-speech" || e.error === "aborted") return;
       sttActive.current = false;
       if (sttOkRef.current) return;
@@ -132,13 +155,23 @@ export default function Check() {
         : "Speech recognition stopped working. Reload and try again."
       );
     };
-    rec.onend = () => { if (sttActive.current) setTimeout(() => { try { rec.start(); } catch { /* busy */ } }, 250); };
+    rec.onend = () => {
+      if (recRef.current !== rec) return;
+      if (sttActive.current) {
+        setTimeout(() => {
+          if (recRef.current !== rec) return;
+          try { rec.start(); } catch { /* busy */ }
+        }, 250);
+      }
+    };
     recRef.current = rec;
     sttActive.current = true;
     try { rec.start(); } catch { /* already started */ }
   }, []);
 
   const startMedia = useCallback(async (cam) => {
+    const gen = ++mediaGen.current;
+    const stale = () => gen !== mediaGen.current;
     stopMedia();
     setPerm("asking");
     const audio = { echoCancellation: true, noiseSuppression: true };
@@ -151,16 +184,20 @@ export default function Check() {
         if (err.name === "OverconstrainedError") stream = await navigator.mediaDevices.getUserMedia({ video: true, audio });
         else throw err;
       }
+      // A newer request or an unmount happened while permission was pending.
+      if (stale()) { stream.getTracks().forEach((t) => t.stop()); return; }
       streamRef.current = stream;
       if (videoRef.current) { videoRef.current.srcObject = stream; videoRef.current.play().catch(() => {}); }
       setPerm("granted");
       setMicLabel(stream.getAudioTracks()[0]?.label || "");
       setCamId(stream.getVideoTracks()[0]?.getSettings().deviceId || "");
       const list = await navigator.mediaDevices.enumerateDevices();
+      if (stale()) return;
       setCams(list.filter((d) => d.kind === "videoinput"));
       startMeter(stream);
       startSpeech();
     } catch (err) {
+      if (stale()) return;
       setPerm(
         err.name === "NotAllowedError" || err.name === "SecurityError" ? "denied"
         : err.name === "NotFoundError" ? "missing"
@@ -173,16 +210,33 @@ export default function Check() {
   const playTest = () => {
     if (!HAS_TTS) { setSpk("unsupported"); return; }
     const synth = window.speechSynthesis;
+    const id = ++spkId.current;
+    clearTimeout(spkTimer.current);
     synth.cancel();
+    speakingRef.current = false;
     const u = new SpeechSynthesisUtterance("Hello. This is a speaker test. If you can hear me clearly, press yes.");
     u.lang = "en-IN";
     u.rate = 0.95;
-    const done = () => { speakingRef.current = false; setSpk((s) => (s === "playing" ? "asked" : s)); };
-    u.onstart = () => { speakingRef.current = true; setSpk("playing"); };
+    const done = () => {
+      if (spkId.current !== id) return;
+      clearTimeout(spkTimer.current);
+      spkTimer.current = null;
+      speakingRef.current = false;
+      setSpk((s) => (s === "playing" ? "asked" : s));
+    };
+    u.onstart = () => {
+      if (spkId.current !== id) return;
+      speakingRef.current = true;
+      setSpk("playing");
+    };
     u.onend = done;
     u.onerror = done;
     synth.speak(u);
-    setTimeout(() => { if (speakingRef.current) { synth.cancel(); done(); } }, 9000); // safety net
+    spkTimer.current = setTimeout(() => {
+      if (spkId.current !== id) return;
+      synth.cancel();
+      done();
+    }, 9000); // safety net
   };
 
   if (session === undefined) return <div className="splash" />;
@@ -191,10 +245,22 @@ export default function Check() {
   const camOk = perm === "granted";
   const failed = ["denied", "missing", "busy", "error", "unsupported"].includes(perm);
   const spkOk = spk === "ok";
-  const left = [camOk, micOk, sttOk, spkOk].filter((x) => !x).length;
+  const nameStatus = validateCandidateName(candidateName);
+  const nameOk = nameStatus.valid;
+
+  const left = [nameOk, camOk, micOk, sttOk, spkOk].filter((x) => !x).length;
   const ready = left === 0;
 
   const rows = [
+    {
+      key: "name", title: "Authorized identity",
+      state: nameOk ? "ok" : nameTouched ? "fail" : "todo",
+      text: nameOk
+        ? `Confirmed: ${nameStatus.name}`
+        : nameTouched && nameStatus.error
+        ? nameStatus.error
+        : "Confirm your authorized full name matching your official ID.",
+    },
     {
       key: "cam", title: "Camera",
       state: camOk ? "ok" : failed ? "fail" : perm === "asking" ? "work" : "todo",
@@ -236,17 +302,26 @@ export default function Check() {
     },
   ];
 
-  const handleJoin = () => {
+  const handleJoin = async () => {
     if (!ready) return;
     stopMedia();
     stopSpeech();
+    try {
+      await updateSession(user.uid, id, { candidateName: nameStatus.name });
+    } catch {
+      /* offline mock resilient */
+    }
     navigate(`/app/interview/${id}`);
   };
 
   const JoinButton = ({ className = "" }) => (
     <button className={`btn btn-primary ${className}`} onClick={handleJoin} disabled={!ready}>Join interview</button>
   );
-  const status = ready ? "All checks passed. You're ready." : `${left} ${left === 1 ? "check" : "checks"} left`;
+  const status = ready
+    ? "All checks passed. You're ready."
+    : !nameOk
+    ? "Confirm your authorized name to proceed"
+    : `${left} ${left === 1 ? "check" : "checks"} left`;
 
   return (
     <div className="page prep">
@@ -313,7 +388,41 @@ export default function Check() {
           {/* ---------- Checklist ---------- */}
           <aside className="lobby-right">
             <div className="prep-card glass" style={{ "--d": "0.2s" }}>
-              <h2>Your checklist</h2>
+              <div className="id-confirm-block">
+                <h2>Candidate identity</h2>
+                <p className="id-desc">
+                  Confirm your authorized full name as it appears on your official college ID or accepted identity document.
+                </p>
+                <div className="id-field-wrap">
+                  <label htmlFor="candidate-name-field" className="id-label">
+                    Authorized full name <span className="req">*</span>
+                  </label>
+                  <input
+                    id="candidate-name-field"
+                    type="text"
+                    className={`id-input ${nameTouched && !nameOk ? "has-error" : nameOk ? "is-valid" : ""}`}
+                    value={candidateName}
+                    placeholder="e.g. Rahul Sharma"
+                    autoComplete="name"
+                    onChange={(e) => {
+                      setCandidateName(e.target.value);
+                      if (!nameTouched) setNameTouched(true);
+                    }}
+                    onBlur={() => setNameTouched(true)}
+                  />
+                  {nameTouched && !nameOk && (
+                    <p className="id-error" role="alert">{nameStatus.error}</p>
+                  )}
+                  {nameOk && (
+                    <p className="id-valid">&#10003; Name confirmed for this session</p>
+                  )}
+                  <small className="id-disclaimer">
+                    Note: Self-confirmed for session records. Automated document or government database verification is not performed.
+                  </small>
+                </div>
+              </div>
+
+              <h2 style={{ marginTop: "20px" }}>Setup checklist</h2>
               <ul className="checks">
                 {rows.map((r, i) => (
                   <li key={r.key} className={`ck ${r.state}`}>

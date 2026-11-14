@@ -1,0 +1,188 @@
+rules_version = '2';
+
+// Production Firestore rules for the interview app.
+// Publish with:  firebase deploy --only firestore:rules
+// Or paste into Firebase Console -> Firestore Database -> Rules.
+//
+// Every user can only read and modify their own profile and interviews.
+// The Groq key is never stored here.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    // The six recruiters in src/data/personas.js. Shared by the profile
+    // recruiterHistory map and the interview personaId field.
+    function personaIdOk(id) {
+      return id in ['sarkaar', 'aadhi', 'rahul', 'arohi', 'tara', 'radhima'];
+    }
+
+    // ---------------------------------------------------------------
+    // users/{uid} - profile, saved resume, recruiter history
+    // ---------------------------------------------------------------
+    match /users/{uid} {
+
+      // recruiterHistory is a map, not a list:
+      // { male: personaId, female: personaId, last: "male" | "female" }
+      // produced by nextHistory() in src/data/personas.js.
+      function historyOk(h) {
+        return h is map
+          && h.keys().hasOnly(['male', 'female', 'last'])
+          && (!h.keys().hasAny(['male']) || h.male in ['sarkaar', 'aadhi', 'rahul'])
+          && (!h.keys().hasAny(['female']) || h.female in ['arohi', 'tara', 'radhima'])
+          && (!h.keys().hasAny(['last']) || h.last in ['male', 'female']);
+      }
+
+      // Fields written by authService.writeProfile(), dataService.saveResume()
+      // and dataService.patchProfile(). Every one of those writes sets
+      // updatedAt to serverTimestamp(), so it must equal request.time.
+      function profileShapeOk(matchUid) {
+        let d = request.resource.data;
+        return d.keys().hasOnly([
+            'uid', 'displayName', 'email',
+            'createdAt', 'updatedAt',
+            'resume', 'resumeUpdatedAt', 'recruiterHistory'
+          ])
+          && (!d.keys().hasAny(['uid']) || d.uid == matchUid)
+          && (!d.keys().hasAny(['displayName']) || d.displayName is string)
+          && (!d.keys().hasAny(['email']) || d.email is string)
+          && (!d.keys().hasAny(['resume']) || (d.resume is string && d.resume.size() <= 8000))
+          && (!d.keys().hasAny(['createdAt']) || d.createdAt is timestamp)
+          && d.updatedAt == request.time
+          && (!d.keys().hasAny(['resumeUpdatedAt']) || d.resumeUpdatedAt is timestamp)
+          && (!d.keys().hasAny(['recruiterHistory']) || historyOk(d.recruiterHistory));
+      }
+
+      // authService normally creates uid/displayName/email first. saveResume()
+      // and patchProfile() can also create a resume-first document (for example
+      // after the previous rules denied every write). Such a document may fill
+      // in uid/email later, but once present those fields cannot change, and
+      // createdAt is immutable.
+      function ownershipUnchanged() {
+        let old = resource.data;
+        let next = request.resource.data;
+        return (!old.keys().hasAll(['uid']) || next.uid == old.uid)
+          && (!old.keys().hasAll(['email']) || next.email == old.email)
+          && (!old.keys().hasAll(['createdAt']) || next.createdAt == old.createdAt);
+      }
+
+      allow read: if isOwner(uid);
+      allow create: if isOwner(uid) && profileShapeOk(uid);
+      allow update: if isOwner(uid) && profileShapeOk(uid) && ownershipUnchanged();
+
+      // Account deletion is an administrative action, not a client action.
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------
+    // users/{uid}/interviews/{interviewId} - one practice session
+    // ---------------------------------------------------------------
+    match /users/{uid}/interviews/{interviewId} {
+
+      // Entries are written only by addTurn() in Interview.jsx as
+      // { role: "ai" | "user", text: string }.
+      function entryOk(t, i) {
+        let e = t[i];
+        return e is map
+          && e.keys().hasOnly(['role', 'text'])
+          && (e.role == 'ai' || e.role == 'user')
+          && e.text is string;
+      }
+
+      // Firestore rules cannot iterate a list, and the platform limit of 1,000
+      // evaluated expressions per request makes unrolling a realistic
+      // transcript impossible (the emulator denies a 20-entry unroll). The list
+      // is therefore size-capped, and the oldest and newest entries are checked
+      // for shape. Entries in between cannot be validated in rules.
+      function transcriptOk(t) {
+        let n = t.size();
+        return n <= 300
+          && (n < 2 || entryOk(t, 0))
+          && (n < 1 || entryOk(t, n - 1));
+      }
+
+      // status only moves setup -> live -> done. setup -> done is allowed
+      // because the "live" write at Interview.jsx:802 is fire-and-forget and
+      // finish() can write "done" before it is acknowledged.
+      function statusTransitionOk(oldStatus, newStatus) {
+        return (oldStatus == 'setup' && newStatus in ['setup', 'live', 'done'])
+          || (oldStatus == 'live' && newStatus in ['live', 'done']);
+      }
+
+      // Exact payload of dataService.createSession().
+      function createShapeOk() {
+        let d = request.resource.data;
+        return d.keys().hasOnly([
+            'company', 'role', 'minutes', 'resume',
+            'candidateName', 'recruiterCameraOn', 'status',
+            'createdAt', 'updatedAt'
+          ])
+          && d.company is string && d.company.size() >= 2 && d.company.size() <= 60
+          && d.role is string && d.role.size() >= 2 && d.role.size() <= 60
+          && d.minutes is number && d.minutes in [5, 10]
+          && d.resume is string && d.resume.size() >= 80 && d.resume.size() <= 8000
+          && d.candidateName is string && d.candidateName.size() <= 200
+          && d.recruiterCameraOn is bool
+          && d.status == 'setup'
+          && d.createdAt == request.time
+          && d.updatedAt == request.time;
+      }
+
+      // Exact payload of every dataService.updateSession() call.
+      function updateShapeOk() {
+        let d = request.resource.data;
+        let old = resource.data;
+        return d.keys().hasOnly([
+            'company', 'role', 'minutes', 'resume',
+            'candidateName', 'recruiterCameraOn',
+            'personaId', 'status', 'transcript',
+            'startedAt', 'endedAt', 'endReason',
+            'createdAt', 'updatedAt'
+          ])
+          // Identity fields never change after creation.
+          && d.company == old.company
+          && d.role == old.role
+          && d.minutes == old.minutes
+          && d.resume == old.resume
+          && d.createdAt == old.createdAt
+          && d.updatedAt == request.time
+          // Mutable fields.
+          && d.candidateName is string && d.candidateName.size() <= 200
+          && d.recruiterCameraOn is bool
+          && (!d.keys().hasAny(['personaId']) || personaIdOk(d.personaId))
+          && (!old.keys().hasAll(['personaId']) || d.personaId == old.personaId)
+          && (!d.keys().hasAny(['startedAt'])
+              || (d.startedAt is number && d.startedAt > 0 && d.status in ['live', 'done']))
+          && statusTransitionOk(old.status, d.status)
+          // startedAt accompanies the "live" transition (Interview.jsx:802).
+          && (d.status != 'live' || d.keys().hasAll(['startedAt']))
+          // finishedAt/endReason only exist on a finished interview.
+          && (d.status == 'done' || !d.keys().hasAny(['endedAt', 'endReason']))
+          && (d.status != 'done' || (
+               d.keys().hasAll(['transcript', 'endedAt', 'endReason'])
+               && d.transcript is list
+               && transcriptOk(d.transcript)
+               && d.endedAt is number && d.endedAt > 0
+               && (!d.keys().hasAll(['startedAt']) || d.endedAt >= d.startedAt)
+               && d.endReason in ['time', 'no_response', 'complete', 'left']
+             ));
+      }
+
+      allow read, delete: if isOwner(uid);
+      allow create: if isOwner(uid) && createShapeOk();
+      allow update: if isOwner(uid) && updateShapeOk();
+    }
+
+    // Deny everything that is not covered above.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

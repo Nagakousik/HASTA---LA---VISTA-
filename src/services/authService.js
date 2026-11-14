@@ -1,106 +1,120 @@
 /**
  * authService.js — the ONLY file that knows how authentication works.
  *
- * Right now it uses a localStorage mock so you can build and test the whole
- * sign-in flow today. When you add Firebase, replace the function bodies
- * (see the commented block at the bottom). Keep the exports and the user
- * shape { uid, name, email } the same and nothing else in the app changes.
+ * Uses Firebase Authentication (email/password + Google). The rest of the app
+ * only sees the small user shape { uid, name, email }, so pages and routing
+ * stay unchanged.
  *
- * DEV ONLY: the mock stores passwords in plain text in localStorage.
+ * Passwords are handled entirely by Firebase Authentication. They are never
+ * stored in localStorage or Firestore.
  */
 
-const USERS_KEY = "talkmate_users";
-const SESSION_KEY = "talkmate_session";
-const listeners = new Set();
+import {
+  createUserWithEmailAndPassword,
+  GoogleAuthProvider,
+  onAuthStateChanged,
+  signInWithEmailAndPassword,
+  signInWithPopup,
+  signOut as fbSignOut,
+  updateProfile,
+} from "firebase/auth";
+import { doc, getDoc, serverTimestamp, setDoc } from "firebase/firestore";
+import { auth, db, firebaseConfigError } from "./firebase";
 
-const read = (key, fallback) => {
-  try { return JSON.parse(localStorage.getItem(key)) ?? fallback; }
-  catch { return fallback; }
-};
-const write = (key, value) => localStorage.setItem(key, JSON.stringify(value));
-const publicUser = ({ uid, name, email }) => ({ uid, name, email });
-const fail = (code) => Object.assign(new Error(code), { code }); // same codes Firebase uses
-const delay = (ms = 500) => new Promise((r) => setTimeout(r, ms));
+const NOT_CONFIGURED = "auth/firebase-not-configured";
 
-function setSession(user) {
-  if (user) write(SESSION_KEY, user); else localStorage.removeItem(SESSION_KEY);
-  listeners.forEach((fn) => fn(user));
+const fail = (code, message) => Object.assign(new Error(message || code), { code });
+
+function requireFirebase() {
+  if (!auth || !db) throw fail(NOT_CONFIGURED, firebaseConfigError || "Firebase is not configured.");
 }
 
-/** Calls cb(user | null) now and on every change. Returns an unsubscribe function. */
+const toUser = (u, nameOverride) =>
+  u && { uid: u.uid, name: nameOverride ?? u.displayName ?? "", email: u.email || "" };
+
+/**
+ * Writes users/{uid}. Best effort: a successful sign-in must not be reported as
+ * a failure just because the profile write was rejected. This can happen before
+ * the Firestore rules are published; the write is retried on the next sign-in.
+ */
+async function writeProfile(user, { created }) {
+  try {
+    const ref = doc(db, "users", user.uid);
+    let isNew = created;
+    if (!isNew) {
+      // One read on Google sign-in so createdAt is set only on the first one.
+      const snap = await getDoc(ref);
+      isNew = !snap.exists();
+    }
+    await setDoc(
+      ref,
+      {
+        uid: user.uid,
+        displayName: user.displayName || "",
+        email: user.email || "",
+        updatedAt: serverTimestamp(),
+        ...(isNew ? { createdAt: serverTimestamp() } : {}),
+      },
+      { merge: true },
+    );
+  } catch (err) {
+    console.error(
+      "[auth] Signed in, but the user profile could not be written to Firestore. " +
+        "Publish the Firestore security rules (firestore.rules), then sign in again.",
+      err,
+    );
+  }
+}
+
+/** Calls cb(user | null) now and on every auth change. Returns an unsubscribe function. */
 export function onAuthChange(cb) {
-  listeners.add(cb);
-  cb(read(SESSION_KEY, null)); // restores the session, so returning users stay signed in
-  return () => listeners.delete(cb);
+  if (!auth) {
+    cb(null);
+    return () => {};
+  }
+  return onAuthStateChanged(auth, (u) => cb(toUser(u)));
 }
 
 export async function signUp({ name, email, password }) {
-  await delay();
-  const users = read(USERS_KEY, []);
-  const mail = email.trim().toLowerCase();
-  if (users.some((u) => u.email === mail)) throw fail("auth/email-already-in-use");
-  if (password.length < 6) throw fail("auth/weak-password");
-  const user = { uid: crypto.randomUUID(), name: name.trim(), email: mail, password };
-  write(USERS_KEY, [...users, user]);
-  setSession(publicUser(user));
-  return publicUser(user);
+  requireFirebase();
+  const cleanName = (name || "").trim();
+  const cleanEmail = (email || "").trim().toLowerCase();
+  const { user } = await createUserWithEmailAndPassword(auth, cleanEmail, password);
+
+  if (cleanName) {
+    try {
+      await updateProfile(user, { displayName: cleanName });
+    } catch (err) {
+      // The account exists; keep the name in the profile document anyway.
+      console.error("[auth] Could not set the Firebase display name.", err);
+    }
+  }
+
+  await writeProfile(user, { created: true });
+  return toUser(user, cleanName);
 }
 
 export async function signIn({ email, password }) {
-  await delay();
-  const mail = email.trim().toLowerCase();
-  const found = read(USERS_KEY, []).find((u) => u.email === mail && u.password === password);
-  if (!found) throw fail("auth/invalid-credential");
-  setSession(publicUser(found));
-  return publicUser(found);
+  requireFirebase();
+  const cleanEmail = (email || "").trim().toLowerCase();
+  const { user } = await signInWithEmailAndPassword(auth, cleanEmail, password);
+  // Self-heals a profile document that could not be written at signup (for
+  // example before the security rules were published). Not awaited: signing in
+  // must not wait on an extra Firestore round-trip.
+  void writeProfile(user, { created: false });
+  return toUser(user);
 }
 
 export async function signInWithGoogle() {
-  await delay();
-  const user = { uid: "google-demo", name: "Demo Student", email: "demo@hastalavista.app" };
-  setSession(user);
-  return user;
+  requireFirebase();
+  const provider = new GoogleAuthProvider();
+  provider.setCustomParameters({ prompt: "select_account" });
+  const { user } = await signInWithPopup(auth, provider);
+  await writeProfile(user, { created: false });
+  return toUser(user);
 }
 
 export async function signOut() {
-  await delay(150);
-  setSession(null);
+  if (!auth) return;
+  await fbSignOut(auth);
 }
-
-/* ======================= FIREBASE VERSION (later) =======================
-npm i firebase
-
-import { initializeApp } from "firebase/app";
-import {
-  getAuth, onAuthStateChanged, createUserWithEmailAndPassword,
-  signInWithEmailAndPassword, signInWithPopup, GoogleAuthProvider,
-  updateProfile, signOut as fbSignOut,
-} from "firebase/auth";
-import { getFirestore, doc, setDoc, serverTimestamp } from "firebase/firestore";
-
-const app = initializeApp({ apiKey: "...", authDomain: "...", projectId: "..." });
-const auth = getAuth(app);
-export const db = getFirestore(app);
-
-const toUser = (u) => u && { uid: u.uid, name: u.displayName || "", email: u.email };
-
-export const onAuthChange = (cb) => onAuthStateChanged(auth, (u) => cb(toUser(u)));
-
-export async function signUp({ name, email, password }) {
-  const { user } = await createUserWithEmailAndPassword(auth, email, password);
-  await updateProfile(user, { displayName: name });
-  await setDoc(doc(db, "users", user.uid), { name, email, createdAt: serverTimestamp() });
-  return toUser(user);
-}
-export async function signIn({ email, password }) {
-  const { user } = await signInWithEmailAndPassword(auth, email, password);
-  return toUser(user);
-}
-export async function signInWithGoogle() {
-  const { user } = await signInWithPopup(auth, new GoogleAuthProvider());
-  await setDoc(doc(db, "users", user.uid),
-    { name: user.displayName, email: user.email, lastLogin: serverTimestamp() }, { merge: true });
-  return toUser(user);
-}
-export const signOut = () => fbSignOut(auth);
-========================================================================= */

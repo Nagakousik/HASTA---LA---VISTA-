@@ -285,7 +285,7 @@ function Features() {
 const STEPS = [
   ["Configure details", "Choose your company, select a duration and add your resume."],
   ["Enter the hot seat", "Allow camera and mic, then talk to the recruiter out loud."],
-  ["Review your scorecard", "Get a pastel dashboard with a readiness score out of 100."],
+  ["Review the transcript", "See every question, every answer, and why the interview ended."],
 ];
 
 function HowItWorks() {

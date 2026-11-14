@@ -48,6 +48,9 @@ export default function Prep() {
   const [loadedName, setLoadedName] = useState("");
   const errRef = useRef(null);
   const toastTimer = useRef(null);
+  const resumeTouched = useRef(false);
+  const startingRef = useRef(false);
+  const savingRef = useRef(false);
 
   const first = (user.name || user.email || "there").split(/[\s@]/)[0];
   const dirty = resume.trim() !== saved.trim();
@@ -56,7 +59,13 @@ export default function Prep() {
   useEffect(() => {
     let off = false;
     getProfile(user.uid)
-      .then((p) => { if (!off) { setSaved(p.resume || ""); setResume(p.resume || ""); } })
+      .then((p) => {
+        if (off) return;
+        const savedText = p.resume || "";
+        setSaved(savedText);
+        // Never overwrite a resume the candidate pasted or uploaded while loading.
+        if (!resumeTouched.current) setResume(savedText);
+      })
       .catch(() => {})
       .finally(() => { if (!off) setLoading(false); });
     return () => { off = true; };
@@ -95,6 +104,7 @@ export default function Prep() {
         }
         text = await read(file);
       }
+      resumeTouched.current = true;
       setResume(text.slice(0, MAX_CHARS));
       setLoadedName(file.name);
       flash("Resume loaded from file");
@@ -106,7 +116,8 @@ export default function Prep() {
   };
 
   const handleSave = async () => {
-    if (!resume.trim()) return;
+    if (!resume.trim() || savingRef.current) return;
+    savingRef.current = true;
     setSaving(true);
     try {
       await saveResume(user.uid, resume.trim());
@@ -115,11 +126,13 @@ export default function Prep() {
     } catch {
       setErrors(["Couldn't save your resume. Check your connection and try again."]);
     } finally {
+      savingRef.current = false;
       setSaving(false);
     }
   };
 
   const handleStart = async () => {
+    if (startingRef.current) return;
     const errs = [];
     if (company.trim().length < 2) errs.push("Enter the company you're practising for.");
     if (role.trim().length < 2) errs.push("Enter the role you're applying for.");
@@ -127,13 +140,21 @@ export default function Prep() {
     setErrors(errs);
     if (errs.length) return;
 
+    startingRef.current = true;
     setBusy(true);
     try {
       // First time: your resume becomes the saved one. Later: only if you tick the box.
       if (!saved || (alsoSave && dirty)) await saveResume(user.uid, resume.trim());
-      const s = await createSession(user.uid, { company: company.trim(), role: role.trim(), minutes, resume: resume.trim() });
+      const s = await createSession(user.uid, {
+        company: company.trim(),
+        role: role.trim(),
+        minutes,
+        resume: resume.trim(),
+        candidateName: (user.name || "").trim(),
+      });
       navigate(`/app/check/${s.id}`);
     } catch {
+      startingRef.current = false;
       setErrors(["Couldn't start the session. Please try again."]);
       setBusy(false);
     }
@@ -202,7 +223,7 @@ export default function Prep() {
               value={resume}
               maxLength={MAX_CHARS}
               disabled={loading}
-              onChange={(e) => { setResume(e.target.value); setLoadedName(""); }}
+              onChange={(e) => { resumeTouched.current = true; setResume(e.target.value); setLoadedName(""); }}
               placeholder={loading ? "Loading your resume..." : "Example: Built a real-time chat app with Node.js, Socket.io and MongoDB for 500 users. Led a team of 4 on a college hackathon project. Skills: React, Express, SQL, Git..."}
             />
 

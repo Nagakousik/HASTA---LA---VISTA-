@@ -1,75 +1,116 @@
 /**
- * dataService.js: the ONLY file that knows where user data is stored.
+ * dataService.js — the ONLY file that knows where user data is stored.
  *
- * Now: a localStorage mock so the whole flow works today.
- * Later: swap the function bodies for the Firestore version at the bottom.
- * Keep the exports and return shapes the same and no page needs to change.
+ * Firestore layout:
+ *   users/{uid}                         -> { uid, displayName, email, resume,
+ *                                            resumeUpdatedAt, recruiterHistory,
+ *                                            createdAt, updatedAt }
+ *   users/{uid}/interviews/{interviewId} -> { company, role, minutes, resume,
+ *                                            candidateName, recruiterCameraOn,
+ *                                            personaId, status, transcript,
+ *                                            startedAt, endedAt, endReason,
+ *                                            createdAt, updatedAt }
  *
- * Data layout (same in the mock and in Firestore):
- *   users/{uid}                -> { resume, resumeUpdatedAt }
- *   users/{uid}/sessions/{id}  -> { company, role, minutes, resume, status, createdAt, ... }
+ * The exported function signatures and return shapes match the previous
+ * localStorage mock, so pages did not need to change.
  */
 
-const profileKey = (uid) => `hlv_profile_${uid}`;
-const sessionsKey = (uid) => `hlv_sessions_${uid}`;
-const delay = (ms = 200) => new Promise((r) => setTimeout(r, ms));
+import {
+  addDoc,
+  collection,
+  doc,
+  getDoc,
+  serverTimestamp,
+  setDoc,
+  updateDoc,
+} from "firebase/firestore";
+import { db, firebaseConfigError } from "./firebase";
 
-const read = (key, fallback) => {
-  try { return JSON.parse(localStorage.getItem(key)) ?? fallback; }
-  catch { return fallback; }
-};
-const write = (key, value) => localStorage.setItem(key, JSON.stringify(value));
+function requireDb() {
+  if (!db) {
+    throw Object.assign(new Error(firebaseConfigError || "Firebase is not configured."), {
+      code: "firebase/not-configured",
+    });
+  }
+}
 
-/** The user's saved (main) resume. */
+const profileDoc = (uid) => doc(db, "users", uid);
+const interviews = (uid) => collection(db, "users", uid, "interviews");
+const interviewDoc = (uid, id) => doc(db, "users", uid, "interviews", id);
+
+/** Firestore Timestamps -> milliseconds, so pages see the same shape as before. */
+const millis = (value) =>
+  value && typeof value.toMillis === "function" ? value.toMillis() : value;
+
+function toSession(snap) {
+  const data = snap.data() || {};
+  return {
+    ...data,
+    id: snap.id,
+    createdAt: millis(data.createdAt),
+    updatedAt: millis(data.updatedAt),
+    startedAt: millis(data.startedAt),
+    endedAt: millis(data.endedAt),
+    resumeUpdatedAt: millis(data.resumeUpdatedAt),
+  };
+}
+
+/** The user's saved (main) resume. One read per Prep page load. */
 export async function getProfile(uid) {
-  await delay();
-  return read(profileKey(uid), { resume: "" });
+  requireDb();
+  const snap = await getDoc(profileDoc(uid));
+  if (!snap.exists()) return { resume: "" };
+  const data = snap.data() || {};
+  return { ...data, resume: data.resume || "" };
 }
 
 export async function saveResume(uid, resume) {
-  await delay();
-  write(profileKey(uid), { ...read(profileKey(uid), {}), resume, resumeUpdatedAt: Date.now() });
+  requireDb();
+  await setDoc(
+    profileDoc(uid),
+    { resume, resumeUpdatedAt: serverTimestamp(), updatedAt: serverTimestamp() },
+    { merge: true },
+  );
+}
+
+/** Merge fields into the profile (for example the recruiter history). */
+export async function patchProfile(uid, patch) {
+  requireDb();
+  await setDoc(
+    profileDoc(uid),
+    { ...patch, updatedAt: serverTimestamp() },
+    { merge: true },
+  );
 }
 
 /** Creates an interview session. The resume here is the copy tailored for THIS interview. */
-export async function createSession(uid, { company, role, minutes, resume }) {
-  await delay();
-  const session = { id: crypto.randomUUID(), company, role, minutes, resume, status: "setup", createdAt: Date.now() };
-  write(sessionsKey(uid), { ...read(sessionsKey(uid), {}), [session.id]: session });
-  return session;
+export async function createSession(uid, { company, role, minutes, resume, candidateName }) {
+  requireDb();
+  const data = {
+    company,
+    role,
+    minutes,
+    resume,
+    candidateName: (candidateName || "").trim(),
+    recruiterCameraOn: Math.random() < 0.5,
+    status: "setup",
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  };
+  const ref = await addDoc(interviews(uid), data);
+  // The caller only needs the id, but return a local copy with plain numbers.
+  return { ...data, id: ref.id, createdAt: Date.now(), updatedAt: Date.now() };
+}
+
+/** Merge fields into an interview (status, personaId, transcript, endReason...). */
+export async function updateSession(uid, id, patch) {
+  requireDb();
+  await updateDoc(interviewDoc(uid, id), { ...patch, updatedAt: serverTimestamp() });
+  return { id, ...patch };
 }
 
 export async function getSession(uid, id) {
-  await delay(100);
-  return read(sessionsKey(uid), {})[id] || null;
+  requireDb();
+  const snap = await getDoc(interviewDoc(uid, id));
+  return snap.exists() ? toSession(snap) : null;
 }
-
-/* ======================= FIRESTORE VERSION (later) =======================
-Create services/firebase.js that exports `db` (initializeApp + getFirestore),
-then replace the functions above with:
-
-import { doc, getDoc, setDoc, addDoc, collection, serverTimestamp } from "firebase/firestore";
-import { db } from "./firebase";
-
-export async function getProfile(uid) {
-  const snap = await getDoc(doc(db, "users", uid));
-  return snap.exists() ? snap.data() : { resume: "" };
-}
-export async function saveResume(uid, resume) {
-  await setDoc(doc(db, "users", uid), { resume, resumeUpdatedAt: serverTimestamp() }, { merge: true });
-}
-export async function createSession(uid, data) {
-  const ref = await addDoc(collection(db, "users", uid, "sessions"),
-    { ...data, status: "setup", createdAt: serverTimestamp() });
-  return { id: ref.id, ...data };
-}
-export async function getSession(uid, id) {
-  const snap = await getDoc(doc(db, "users", uid, "sessions", id));
-  return snap.exists() ? { id: snap.id, ...snap.data() } : null;
-}
-
-Firestore security rules (so users only see their own data):
-  match /users/{uid}/{document=**} {
-    allow read, write: if request.auth != null && request.auth.uid == uid;
-  }
-========================================================================= */

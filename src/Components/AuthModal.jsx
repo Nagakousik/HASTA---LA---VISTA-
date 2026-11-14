@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useAuth } from "../context/AuthContext";
 import "./AuthModal.css";
 
-// Works with both the mock and Firebase, since the mock uses Firebase's error codes.
+// Firebase Authentication error codes -> friendly text.
 const MESSAGES = {
   "auth/email-already-in-use": "This email already has an account. Try signing in instead.",
   "auth/invalid-credential": "Email or password is incorrect.",
@@ -10,8 +10,17 @@ const MESSAGES = {
   "auth/wrong-password": "Email or password is incorrect.",
   "auth/weak-password": "Use at least 6 characters for your password.",
   "auth/invalid-email": "Enter a valid email address.",
-  "auth/popup-closed-by-user": "Google sign-in was closed. Try again.",
+  "auth/user-disabled": "This account has been disabled.",
+  "auth/too-many-requests": "Too many attempts. Wait a moment and try again.",
   "auth/network-request-failed": "No connection. Check your internet and try again.",
+  "auth/popup-closed-by-user": "Google sign-in was closed. Try again.",
+  "auth/popup-blocked": "Your browser blocked the Google pop-up. Allow pop-ups and try again.",
+  "auth/cancelled-popup-request": "Google sign-in was interrupted. Try again.",
+  "auth/account-exists-with-different-credential": "This email already uses a different sign-in method.",
+  "auth/operation-not-allowed": "This sign-in method is not enabled in Firebase.",
+  "auth/unauthorized-domain": "Google sign-in is not allowed from this domain. Add it in Firebase Console → Authentication → Settings → Authorized domains.",
+  "auth/invalid-api-key": "Firebase rejected the configured API key. Check the VITE_FIREBASE_* values in .env.local.",
+  "auth/firebase-not-configured": "Sign-in is unavailable because Firebase is not configured. Add the VITE_FIREBASE_* values to .env.local and restart the app.",
 };
 
 const Icon = ({ d }) => (
@@ -44,7 +53,13 @@ export default function AuthModal({ open, mode: startMode, onClose, onSuccess })
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
-  useEffect(() => { if (open) { setMode(startMode); setError(""); setShowPw(false); } }, [open, startMode]);
+  useEffect(() => {
+    if (!open) return;
+    setMode(startMode);
+    setForm({ name: "", email: "", password: "" });
+    setError("");
+    setShowPw(false);
+  }, [open, startMode]);
 
   useEffect(() => {
     if (!open) return;
@@ -96,13 +111,13 @@ export default function AuthModal({ open, mode: startMode, onClose, onSuccess })
 
           <div className="side-copy">
             <h3>{isSignup ? "Your calm space to practise the real thing." : "Good to see you again."}</h3>
-            <p>{isSignup ? "Friendly room. Serious recruiter. Honest feedback." : "Pick up where you left off and keep improving."}</p>
+            <p>{isSignup ? "Friendly room. Serious recruiter. Full transcript." : "Pick up where you left off and keep improving."}</p>
           </div>
 
           <div className="side-chat">
             <p className="sb ai"><small>Recruiter</small>Walk me through your best project.</p>
             <p className="sb me"><small>You</small>Sure! I built a real-time chat app…</p>
-            <span className="score-chip">Readiness <b>82</b>/100</span>
+            <span className="score-chip">Transcript <b>saved</b></span>
           </div>
         </aside>
 

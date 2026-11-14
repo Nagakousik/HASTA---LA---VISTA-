@@ -17,9 +17,11 @@ export function AuthProvider({ children }) {
   const value = {
     user,
     loading,
-    signUp: auth.signUp,
-    signIn: auth.signIn,
-    signInWithGoogle: auth.signInWithGoogle,
+    // Set the user immediately from the sign-in result, then let the Firebase
+    // listener keep it in sync (including restored sessions after a reload).
+    signUp: async (data) => { const u = await auth.signUp(data); setUser(u); return u; },
+    signIn: async (data) => { const u = await auth.signIn(data); setUser(u); return u; },
+    signInWithGoogle: async () => { const u = await auth.signInWithGoogle(); setUser(u); return u; },
     signOut: auth.signOut,
   };
 
